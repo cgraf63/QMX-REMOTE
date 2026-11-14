@@ -1,0 +1,772 @@
+/*
+ * QMX-REMOTE - remote page for the QRP Labs QMX / QMX+
+ * (taken over from the SHACK-SERVER QMX page)
+ *
+ *   GET  /api/radio           state, polled every 400 ms (409: searching)
+ *   GET  /api/radio/tables    modes, bands, tune steps
+ *   POST /api/radio/control   { control, value }
+ *   POST /api/radio/bands     band version (saved on the box)
+ *   GET/POST /api/settings    callsign for {CALL}
+ *   WS   /audio               RX audio, 48 kHz, 16 bit, mono
+ *
+ * The LCD shows the real 2 x 16 characters of the QMX (CAT "LC;"),
+ * drawn as a 5 x 7 dot matrix. Older firmware without LC: the LCD is
+ * built from frequency, mode and VFO.
+ */
+(() => {
+
+    const $ = id => document.getElementById(id);
+
+    /* 5 x 7 font, ASCII 32..126, 5 column bytes per character (bit 0 = top).
+       Classic GLCD font from the Adafruit GFX library (BSD licence). */
+    const FONT = "000000000000005f00000007000700147f147f14242a7f2a12231308646236495620500008070300001c2241000041221c002a1c7f1c2a08083e080800807030000808080808000060600020100804023e5149453e00427f400072494949462141494d331814127f1027454545393c4a49493141211109073649494936464949291e0000140000004034000000081422411414141414004122140802015909063e415d594e7c1211127c7f494949363e414141227f4141413e7f494949417f090909013e414151737f0808087f00417f41002040413f017f081422417f404040407f021c027f7f0408107f3e4141413e7f090909063e4151215e7f09192946264949493203017f01033f4040403f1f2040201f3f4038403f631408146303047804036159494d43007f4141410204081020004141417f04020102044040404040000307080020545478407f284444383844444428384444287f385454541800087e090218a4a49c787f0804047800447d40002040403d007f1028440000417f40007c047804787c080404783844444438fc1824241818242418fc7c08040408485454542404043f44243c4040207c1c2040201c3c4030403c44281028444c9090907c4464544c440008364100000077000000413608000201020402";
+
+    let state = null;
+    let tables = { modes: [], bands: [], steps: [] };
+    let myCall = "";
+    let sliderBusy = {};
+    let versionBusy = 0;
+
+    /* ------------------------------------------------------------ helpers */
+
+    function toast(text) {
+        const t = $("toast");
+        t.textContent = text;
+        t.classList.add("show");
+        clearTimeout(t._timer);
+        t._timer = setTimeout(() => t.classList.remove("show"), 2600);
+    }
+
+    async function control(name, value) {
+        try {
+            const response = await fetch("/api/radio/control", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ control: name, value })
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) toast(result.error || `Error ${response.status}`);
+            else setTimeout(poll, 120);
+            return response.ok;
+        }
+        catch {
+            toast("QMX-REMOTE not reachable");
+            return false;
+        }
+    }
+
+    function fmtFreq(hz) {
+        // 14.060.00 (MHz . kHz . 10 Hz) - like the QMX
+        if (!(hz > 0)) return "--.---.--";
+        const mhz = Math.floor(hz / 1e6);
+        const khz = Math.floor(hz / 1e3) % 1000;
+        const ten = Math.floor(hz / 10) % 100;
+        return `${mhz}.${String(khz).padStart(3, "0")}.${String(ten).padStart(2, "0")}`;
+    }
+
+    function stepText(hz) {
+        if (!hz) return "—";
+        if (hz >= 1e6) return `${hz / 1e6} MHz`;
+        if (hz >= 1e3) return `${hz / 1e3} kHz`;
+        return `${hz} Hz`;
+    }
+
+    /* ------------------------------------------------------------ tuning */
+
+    /* step of the knob, the LCD, the arrows (here, not on the QMX - older
+       firmware has no TR command); remembered in this browser */
+    const STEPS = [10, 50, 100, 500, 1000, 5000, 10000];
+    let step = 100;
+    try { step = Number(localStorage.getItem("qmx-step")) || 100; } catch { /* no storage */ }
+    if (!STEPS.includes(step)) step = 100;
+
+    function setStep(value) {
+        step = value;
+        try { localStorage.setItem("qmx-step", String(value)); } catch { /* no storage */ }
+        $("step-val").textContent = stepText(step);
+        $("knob-step").textContent = stepText(step);
+    }
+
+    /* the frequency moves at once on the page, the QMX gets at most
+       ~12 commands per second (absolute frequency, nothing gets lost) */
+    const tuning = { target: 0, holdUntil: 0, timer: null, angle: 0 };
+
+    function tuneBy(steps) {
+        if (!state || !steps) return;
+        const now = Date.now();
+        const base = now < tuning.holdUntil && tuning.target ? tuning.target : state.frequency;
+        if (!(base > 0)) return;
+        tuning.target = Math.max(100000, Math.min(60e6, Math.round(base / step) * step + steps * step));
+        tuning.holdUntil = now + 1200;
+        displayLcd(state);
+        if (!tuning.timer) sendTarget();
+    }
+
+    function sendTarget() {
+        tuning.timer = setTimeout(async () => {
+            const target = tuning.target;
+            await control("frequency", target);
+            tuning.timer = null;
+            if (tuning.target !== target) sendTarget();
+        }, 80);
+    }
+
+    function rotateKnob(deg) {
+        tuning.angle = (tuning.angle + deg) % 360;
+        $("knob").style.transform = `rotate(${tuning.angle}deg)`;
+    }
+
+    function setupKnob() {
+
+        const knob = $("knob");
+        let last = null;
+        let acc = 0;
+
+        const angleOf = event => {
+            const r = knob.getBoundingClientRect();
+            return Math.atan2(event.clientY - (r.top + r.height / 2), event.clientX - (r.left + r.width / 2)) * 180 / Math.PI;
+        };
+
+        knob.addEventListener("pointerdown", event => {
+            knob.setPointerCapture(event.pointerId);
+            last = angleOf(event);
+            acc = 0;
+        });
+
+        knob.addEventListener("pointermove", event => {
+            if (last === null) return;
+            const a = angleOf(event);
+            let d = a - last;
+            if (d > 180) d -= 360;
+            if (d < -180) d += 360;
+            last = a;
+            rotateKnob(d);
+            acc += d;
+            // one step per 8 degrees
+            const steps = Math.trunc(acc / 8);
+            if (steps) {
+                acc -= steps * 8;
+                tuneBy(steps);
+            }
+        });
+
+        const end = () => { last = null; };
+        knob.addEventListener("pointerup", end);
+        knob.addEventListener("pointercancel", end);
+
+        knob.addEventListener("wheel", event => {
+            event.preventDefault();
+            const steps = event.deltaY < 0 ? 1 : -1;
+            rotateKnob(steps * 8);
+            tuneBy(steps);
+        }, { passive: false });
+
+    }
+
+    /* ------------------------------------------------------------ LCD */
+
+    const canvas = $("lcd-canvas");
+    const ctx = canvas.getContext("2d");
+    let lastLcd = "";
+
+    function glyph(code) {
+        if (code < 32 || code > 126) return [0, 0, 0, 0, 0];
+        const i = (code - 32) * 10;
+        const out = [];
+        for (let c = 0; c < 5; c++) out.push(parseInt(FONT.slice(i + c * 2, i + c * 2 + 2), 16));
+        return out;
+    }
+
+    function drawLcd(text) {
+
+        text = (text || "").padEnd(32, " ").slice(0, 32);
+        if (text === lastLcd) return;
+        lastLcd = text;
+
+        // 16 characters of 5 dots + 1 dot gap; 2 rows of 8 dots, 3 dots apart
+        const W = canvas.width;
+        const padX = W * 0.035;
+        const cell = (W - 2 * padX) / (16 * 6 - 1);
+        const padY = cell * 2.2;
+        const rowGap = cell * 3;
+        const H = Math.round(2 * padY + 16 * cell + rowGap);
+        if (canvas.height !== H) canvas.height = H;
+        const dot = cell * 0.86;
+
+        ctx.clearRect(0, 0, W, H);
+
+        for (let row = 0; row < 2; row++) {
+            for (let col = 0; col < 16; col++) {
+
+                const bits = glyph(text.charCodeAt(row * 16 + col));
+                const x0 = padX + col * 6 * cell;
+                const y0 = padY + row * (8 * cell + rowGap);
+
+                for (let c = 0; c < 5; c++) {
+                    for (let r = 0; r < 8; r++) {
+                        const on = (bits[c] >> r) & 1;
+                        ctx.fillStyle = on ? "#1d2606" : "rgba(29, 38, 6, 0.075)";
+                        ctx.fillRect(x0 + c * cell, y0 + r * cell, dot, dot);
+                    }
+                }
+
+            }
+        }
+
+    }
+
+    /* LCD text without LC (older firmware): built from the CAT values */
+    function syntheticLcd(s) {
+        const line1 = `${s.vfo}${s.split ? "S" : " "}${fmtFreq(s.frequency).padStart(10, " ")} ${String(s.mode || "").slice(0, 3)}`;
+        const line2 = s.tx
+            ? `TX ${s.meters.power.toFixed(1)}W SWR${s.meters.swr ? s.meters.swr.toFixed(1) : "-"}`
+            : `S${Math.min(9, Math.round(s.meters.s))} ${s.keyerSpeed ? s.keyerSpeed + "WPM" : ""} ${s.rit.on ? "R" + (s.rit.offset >= 0 ? "+" : "") + s.rit.offset : ""}`;
+        return line1.padEnd(16, " ").slice(0, 16) + line2.padEnd(16, " ").slice(0, 16);
+    }
+
+    /* while tuning the LCD shows the new frequency at once (the QMX
+       answers a moment later) */
+    function withFrequency(text, s, hz) {
+        if (!s.lcd) return syntheticLcd({ ...s, frequency: hz });
+        const line1 = text.slice(0, 16);
+        const match = /\d{1,2}\.\d{3}\.\d{2}/.exec(line1);
+        if (!match) return text;
+        const value = fmtFreq(hz).padStart(match[0].length, " ");
+        const start = match.index + match[0].length - value.length;
+        if (start < 0) return text;
+        return (line1.slice(0, start) + value + line1.slice(match.index + match[0].length)).padEnd(16, " ").slice(0, 16) + text.slice(16);
+    }
+
+    function displayLcd(s) {
+        let text = s.lcd || syntheticLcd(s);
+        if (tuning.target && Date.now() < tuning.holdUntil) text = withFrequency(text, s, tuning.target);
+        drawLcd(text);
+    }
+
+    /* touch / mouse tuning on the LCD */
+    (() => {
+
+        const lcd = $("lcd");
+        let startX = null;
+        let moved = 0;
+        let accumulated = 0;
+        let wheelTimer = null;
+        let wheelSteps = 0;
+
+        const flash = side => {
+            const zone = $(side === "left" ? "zone-left" : "zone-right");
+            zone.classList.add("flash");
+            setTimeout(() => zone.classList.remove("flash"), 160);
+        };
+
+        lcd.addEventListener("pointerdown", event => {
+            startX = event.clientX;
+            moved = 0;
+            accumulated = 0;
+            lcd.setPointerCapture(event.pointerId);
+        });
+
+        lcd.addEventListener("pointermove", event => {
+            if (startX === null) return;
+            const dx = event.clientX - startX;
+            moved = Math.max(moved, Math.abs(dx));
+            const steps = Math.trunc(dx / 14);
+            if (steps !== accumulated) {
+                tuneBy(steps - accumulated);
+                accumulated = steps;
+            }
+        });
+
+        lcd.addEventListener("pointerup", event => {
+            if (startX === null) return;
+            if (moved < 6) {
+                const rect = lcd.getBoundingClientRect();
+                const right = event.clientX - rect.left > rect.width / 2;
+                flash(right ? "right" : "left");
+                tuneBy(right ? 1 : -1);
+            }
+            startX = null;
+        });
+
+        lcd.addEventListener("pointercancel", () => { startX = null; });
+
+        // wheel: collect steps for 80 ms, then one command
+        lcd.addEventListener("wheel", event => {
+            event.preventDefault();
+            wheelSteps += event.deltaY < 0 ? 1 : -1;
+            clearTimeout(wheelTimer);
+            wheelTimer = setTimeout(() => {
+                const steps = wheelSteps;
+                wheelSteps = 0;
+                if (steps) tuneBy(steps);
+            }, 80);
+        }, { passive: false });
+
+    })();
+
+    /* ------------------------------------------------------------ meters */
+
+    function buildBars() {
+        for (const id of ["m-s-bar", "m-po-bar", "m-swr-bar"]) {
+            $(id).innerHTML = "<i></i>".repeat(20);
+        }
+    }
+
+    function setBar(id, fraction, hotFrom = 1) {
+        const cells = $(id).children;
+        const on = Math.round(Math.max(0, Math.min(1, fraction)) * cells.length);
+        for (let i = 0; i < cells.length; i++) {
+            cells[i].classList.toggle("on", i < on);
+            cells[i].classList.toggle("hot", i < on && i / cells.length >= hotFrom);
+        }
+    }
+
+    function renderMeters(s) {
+
+        // S meter: S0..S9 left half, S9+60 dB right half
+        const sDb = s.meters.sDb;
+        const sFrac = sDb <= 54 ? sDb / 54 * 0.6 : 0.6 + Math.min(1, (sDb - 54) / 40) * 0.4;
+        setBar("m-s-bar", s.tx ? 0 : sFrac, 0.6);
+        $("m-s-val").textContent = s.tx ? "—"
+            : sDb <= 54 ? `S${Math.round(s.meters.s)} · ${sDb} dB` : `S9+${sDb - 54} · ${sDb} dB`;
+
+        $("m-po").classList.toggle("idle", !s.tx);
+        $("m-swr").classList.toggle("idle", !s.tx);
+
+        setBar("m-po-bar", s.tx ? s.meters.power / 6 : 0, 0.85);
+        $("m-po-val").textContent = s.tx ? `${s.meters.power.toFixed(1)} W` : "—";
+
+        const swr = s.meters.swr;
+        setBar("m-swr-bar", s.tx && swr ? (swr - 1) / 2 : 0, 0.5);
+        $("m-swr-val").textContent = s.tx && swr ? swr.toFixed(2) : "—";
+
+    }
+
+    /* ------------------------------------------------------------ keys */
+
+    function buildKeys() {
+
+        $("modes").innerHTML = tables.modes
+            .map(mode => `<button class="k" data-mode="${mode}">${mode}</button>`).join("");
+
+        $("bands").innerHTML = tables.bands
+            .map(band => `<button class="k sm" data-band="${band.name}">${band.name.replace("m", "")}</button>`).join("");
+
+        document.querySelectorAll("[data-mode]").forEach(button =>
+            button.addEventListener("click", () => control("mode", button.dataset.mode)));
+
+        document.querySelectorAll("[data-band]").forEach(button =>
+            button.addEventListener("click", () => control("band", button.dataset.band)));
+
+    }
+
+    function wire() {
+
+        document.querySelectorAll("[data-tune]").forEach(button =>
+            button.addEventListener("click", () => tuneBy(Number(button.dataset.tune))));
+
+        $("band-up").addEventListener("click", () => control("bandUp"));
+
+        // band version (saved in the transceiver config)
+        $("band-version").addEventListener("change", async event => {
+            try {
+                const response = await fetch("/api/radio/bands", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ version: event.target.value })
+                });
+                const result = await response.json().catch(() => ({}));
+                if (!response.ok) toast(result.error || `Error ${response.status}`);
+                else { versionBusy = Date.now(); setTimeout(poll, 100); }
+            }
+            catch {
+                toast("QMX-REMOTE not reachable");
+            }
+        });
+        $("band-down").addEventListener("click", () => control("bandDown"));
+
+        const changeStep = direction => {
+            const index = STEPS.indexOf(step);
+            setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, (index < 0 ? 2 : index) + direction))]);
+        };
+
+        $("step-up").addEventListener("click", () => changeStep(1));
+        $("step-down").addEventListener("click", () => changeStep(-1));
+
+        const setFreq = () => {
+            const raw = $("freq-input").value.trim().replace(",", ".");
+            const value = Number(raw);
+            if (!(value > 0)) return toast("Frequency in kHz, e.g. 14060 or 7030.5");
+            const hz = value < 100 ? value * 1e6 : value * 1e3;   // 14.06 MHz or 14060 kHz
+            control("frequency", Math.round(hz));
+            $("freq-input").value = "";
+            $("freq-input").blur();
+        };
+
+        $("freq-go").addEventListener("click", setFreq);
+        $("freq-input").addEventListener("keydown", event => { if (event.key === "Enter") setFreq(); });
+
+        $("vfo-a").addEventListener("click", () => control("vfo", "A"));
+        $("vfo-b").addEventListener("click", () => control("vfo", "B"));
+        $("split").addEventListener("click", () => control("split", !state?.split));
+        $("a-eq-b").addEventListener("click", () => control("aEqualsB"));
+        $("swap").addEventListener("click", () => control("swap"));
+
+        $("rit").addEventListener("click", () => control("rit", !state?.rit?.on));
+        $("rit-clear").addEventListener("click", () => control("ritClear"));
+        document.querySelectorAll("[data-rit]").forEach(button =>
+            button.addEventListener("click", () => {
+                const offset = Math.max(-9999, Math.min(9999, (state?.rit?.offset || 0) + Number(button.dataset.rit)));
+                if (!state?.rit?.on) control("rit", true);
+                control("ritOffset", offset);
+            }));
+
+        // sliders: send on release, while dragging only the value
+        const slider = (id, controlName, label) => {
+            const input = $(id);
+            input.addEventListener("input", () => {
+                sliderBusy[id] = Date.now();
+                $(`${id}-val`).textContent = label(Number(input.value));
+            });
+            input.addEventListener("change", () => {
+                sliderBusy[id] = Date.now();
+                control(controlName, Number(input.value));
+            });
+        };
+
+        slider("af", "afGain", v => `${(v / 4).toFixed(1)} dB`);
+        slider("rf", "rfGain", v => `${v} dB`);
+        slider("wpm", "keyerSpeed", v => `${v} WPM`);
+
+        // CW
+        const sendCw = async text => {
+            if (/\{CALL\}/.test(text) && !myCall && !(await askCall())) return;
+            text = String(text || "").replace(/\{CALL\}/g, myCall || "").trim();
+            if (!text) return;
+            control("cw", text);
+        };
+
+        $("call").addEventListener("click", () => void askCall());
+
+        $("cw-send").addEventListener("click", () => { sendCw($("cw-text").value); $("cw-text").value = ""; });
+        $("cw-text").addEventListener("keydown", event => {
+            if (event.key === "Enter") { sendCw($("cw-text").value); $("cw-text").value = ""; }
+            if (event.key === "Escape") control("cwStop");
+        });
+        $("cw-stop").addEventListener("click", () => control("cwStop"));
+        document.querySelectorAll("[data-cw]").forEach(button =>
+            button.addEventListener("click", () => sendCw(button.dataset.cw)));
+        $("dec-clear").addEventListener("click", () => control("clearDecoded"));
+
+        // carrier: hold to key
+        const carrier = $("carrier");
+        let carrierOn = false;
+        const down = event => {
+            event.preventDefault();
+            if (carrierOn) return;
+            carrierOn = true;
+            carrier.classList.add("on");
+            control("carrier", true);
+        };
+        const up = () => {
+            if (!carrierOn) return;
+            carrierOn = false;
+            carrier.classList.remove("on");
+            control("carrier", false);
+        };
+        carrier.addEventListener("pointerdown", down);
+        carrier.addEventListener("pointerup", up);
+        carrier.addEventListener("pointerleave", up);
+        carrier.addEventListener("pointercancel", up);
+        window.addEventListener("blur", up);
+
+        // never leave a carrier or CW running when the page is closed
+        window.addEventListener("pagehide", () => {
+            if (state?.tx) navigator.sendBeacon?.("/api/radio/control", new Blob([JSON.stringify({ control: "rx", value: true })], { type: "application/json" }));
+        });
+
+        // remote audio
+        $("audio").addEventListener("click", () => (audio.ctx ? stopAudio() : startAudio()));
+        $("vol").addEventListener("input", event => {
+            $("vol-val").textContent = `${event.target.value} %`;
+            if (audio.gain) audio.gain.gain.value = Number(event.target.value) / 100;
+        });
+
+        // keyboard: arrows tune when no input has the focus
+        document.addEventListener("keydown", event => {
+            if (event.target.closest("input")) return;
+            if (event.key === "ArrowRight" || event.key === "ArrowUp") { event.preventDefault(); tuneBy(event.shiftKey ? 10 : 1); }
+            if (event.key === "ArrowLeft" || event.key === "ArrowDown") { event.preventDefault(); tuneBy(event.shiftKey ? -10 : -1); }
+        });
+
+    }
+
+    /* ------------------------------------------------------------ render */
+
+    function setOn(id, on) {
+        $(id)?.classList.toggle("on", Boolean(on));
+    }
+
+    function render(s) {
+
+        displayLcd(s);
+        $("lcd").classList.toggle("tx", s.tx);
+
+        $("model").textContent = s.model || "QMX";
+        $("fw").textContent = s.version ? `FIRMWARE ${s.version.replace(/(QMX|QDX)$/, "")}` : "";
+
+        renderMeters(s);
+
+        document.querySelectorAll("[data-mode]").forEach(b => b.classList.toggle("on", b.dataset.mode === s.mode));
+        // only the bands of this QMX version
+        const bands = new Set(s.bands || []);
+        document.querySelectorAll("[data-band]").forEach(b => {
+            b.classList.toggle("on", b.dataset.band === s.band);
+            b.hidden = bands.size > 0 && !bands.has(b.dataset.band);
+        });
+
+        const version = $("band-version");
+        if (Date.now() - versionBusy > 1500 && document.activeElement !== version) version.value = s.bandVersion || "auto";
+        version.classList.toggle("ask", Boolean(s.bandVersionUnknown));
+
+        setOn("vfo-a", s.vfo === "A");
+        setOn("vfo-b", s.vfo === "B");
+        setOn("split", s.split);
+        setOn("rit", s.rit.on);
+
+        $("rit-val").textContent = `${s.rit.offset > 0 ? "+" : ""}${s.rit.offset} Hz`;
+        $("step-val").textContent = stepText(step);
+
+        const chips = [
+            `<span class="chip ${s.tx ? "tx" : ""}">${s.tx ? (s.keyDown ? "TX · CARRIER" : "TX") : "RX"}</span>`,
+            `<span class="chip">VFO <b>${s.vfo}</b> ${fmtFreq(s.vfo === "A" ? s.frequencyA : s.frequencyB)}</span>`,
+            `<span class="chip">${s.vfo === "A" ? "B" : "A"} ${fmtFreq(s.vfo === "A" ? s.frequencyB : s.frequencyA)}</span>`,
+            s.split ? `<span class="chip on">SPLIT · TX ${s.txVfo}</span>` : "",
+            s.band ? `<span class="chip">BAND <b>${s.band}</b></span>` : "",
+            `<span class="chip">MODE <b>${s.mode}</b></span>`,
+            s.bandVersionLabel
+                ? `<span class="chip" title="${s.bandVersionDetected ? "Detected from the radio" : "Set in the transceiver settings"}">${s.bandVersionLabel}${s.bandVersionDetected ? " · AUTO" : ""}</span>`
+                : s.bandVersionUnknown
+                    ? `<span class="chip on" title="The firmware cannot report its band (no BN command)">BANDS: CHOOSE THE QMX VERSION ▸</span>`
+                    : "",
+            s.meters.agc ? `<span class="chip">AGC <b>${s.meters.agc} dB</b></span>` : "",
+            s.cwPending ? `<span class="chip on">CW SENDING · ${s.cwPending >= 9 ? "9+" : s.cwPending}</span>` : ""
+        ];
+        $("status").innerHTML = chips.join("");
+
+        const sliderValue = (id, value, label) => {
+            if (value < 0) return;
+            if (Date.now() - (sliderBusy[id] || 0) < 1500) return;
+            $(id).value = value;
+            $(`${id}-val`).textContent = label(value);
+        };
+
+        sliderValue("af", s.afGain, v => `${(v / 4).toFixed(1)} dB`);
+        sliderValue("rf", s.rfGain, v => `${v} dB`);
+        sliderValue("wpm", s.keyerSpeed || -1, v => `${v} WPM`);
+
+        const decoder = $("decoder");
+        decoder.innerHTML = s.decoded
+            ? `<span>${s.decoded.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])}</span>`
+            : `<span class="empty">CW decoder of the QMX …</span>`;
+
+    }
+
+    /* ------------------------------------------------------------ callsign */
+
+    function esc(text) {
+        return String(text).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    }
+
+    function showCall() {
+        $("call").textContent = myCall ? `CALL ${myCall}` : "CALL —";
+    }
+
+    /* asks for the callsign and saves it on the box; true = one is set */
+    async function askCall() {
+        const value = prompt("Your callsign (for {CALL} in the CW keys):", myCall);
+        if (value === null) return Boolean(myCall);
+        const call = value.trim().toUpperCase();
+        try {
+            const response = await fetch("/api/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ callsign: call })
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) { toast(result.error || `Error ${response.status}`); return false; }
+            myCall = call;
+            showCall();
+            return Boolean(myCall);
+        }
+        catch {
+            toast("QMX-REMOTE not reachable");
+            return false;
+        }
+    }
+
+    /* ------------------------------------------------------------ RX audio (/audio: 48 kHz, 16 bit, mono) */
+
+    const audio = { socket: null, ctx: null, node: null, gain: null, ring: new Float32Array(48000), read: 0, write: 0, odd: null };
+
+    function audioAvailable() {
+        return (audio.write - audio.read + audio.ring.length) % audio.ring.length;
+    }
+
+    function pushPcm(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let i = 0;
+        const push = v => {
+            audio.ring[audio.write] = (v < 0x8000 ? v : v - 0x10000) / 32768;
+            audio.write = (audio.write + 1) % audio.ring.length;
+            if (audio.write === audio.read) audio.read = (audio.read + 1) % audio.ring.length;
+        };
+        if (audio.odd !== null && bytes.length) { push(audio.odd | (bytes[0] << 8)); audio.odd = null; i = 1; }
+        for (; i + 1 < bytes.length; i += 2) push(bytes[i] | (bytes[i + 1] << 8));
+        if (i < bytes.length) audio.odd = bytes[i];
+        // latency limit about 0.4 s
+        while (audioAvailable() > 19200) audio.read = (audio.read + 1) % audio.ring.length;
+    }
+
+    function startAudio() {
+
+        audio.ctx = new AudioContext({ sampleRate: 48000 });
+        audio.gain = audio.ctx.createGain();
+        audio.gain.gain.value = Number($("vol").value) / 100;
+        audio.node = audio.ctx.createScriptProcessor(2048, 0, 1);
+        audio.node.onaudioprocess = e => {
+            const out = e.outputBuffer.getChannelData(0);
+            for (let i = 0; i < out.length; i++) {
+                if (audioAvailable() > 0) {
+                    out[i] = audio.ring[audio.read];
+                    audio.read = (audio.read + 1) % audio.ring.length;
+                }
+                else out[i] = 0;
+            }
+        };
+        audio.node.connect(audio.gain).connect(audio.ctx.destination);
+
+        audio.socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/audio`);
+        audio.socket.binaryType = "arraybuffer";
+        audio.socket.onmessage = e => pushPcm(e.data);
+        audio.socket.onclose = () => { if (audio.ctx) { stopAudio(); toast("Audio connection closed"); } };
+
+        $("audio").classList.add("on");
+
+    }
+
+    function stopAudio() {
+        try { audio.socket?.close(); } catch { /* ignore */ }
+        try { audio.node?.disconnect(); } catch { /* ignore */ }
+        audio.ctx?.close().catch(() => undefined);
+        audio.socket = audio.ctx = audio.node = audio.gain = null;
+        audio.read = audio.write = 0;
+        $("audio").classList.remove("on");
+    }
+
+    /* ------------------------------------------------------------ polling */
+
+    function overlay(title, html) {
+        $("ov-title").textContent = title;
+        $("ov-text").innerHTML = html;
+        $("overlay").classList.toggle("show", Boolean(title));
+    }
+
+    function setConn(kind, text) {
+        $("conn").className = `conn ${kind}`;
+        $("conn-text").textContent = text;
+    }
+
+    let polling = false;
+
+    async function poll() {
+
+        if (polling) return;
+        polling = true;
+
+        try {
+
+            const response = await fetch("/api/radio", { cache: "no-store" });
+            const data = await response.json().catch(() => ({}));
+
+            if (response.status === 409) {
+                const st = data.status || {};
+                state = null;
+                if (st.state === "unsupported") {
+                    setConn("bad", "NOT SUPPORTED");
+                    overlay("NOT A QMX",
+                        `${esc(data.error || "This transceiver is not supported.")}<br><br>` +
+                        "QMX-REMOTE works with the QRP Labs QMX and QMX+.");
+                }
+                else {
+                    setConn("bad", "SEARCHING");
+                    overlay("SEARCHING FOR THE QMX",
+                        "Connect the QMX / QMX+ with the USB cable and switch it on." +
+                        (st.message ? `<br><br><span class="note">${esc(st.message)}</span>` : "") +
+                        `<br><br><a href="/wifi.html">Wi-Fi settings</a>`);
+                }
+                return;
+            }
+
+            overlay("");
+
+            state = data;
+
+            if (!data.connected) setConn("bad", data.error ? "PORT ERROR" : "NOT CONNECTED");
+            else if (!data.alive) setConn("bad", "NO ANSWER");
+            else setConn("ok", data.tx ? "TX" : "CONNECTED");
+
+            render(data);
+
+        }
+        catch {
+            setConn("bad", "OFFLINE");
+        }
+        finally {
+            polling = false;
+        }
+
+    }
+
+    function clock() {
+        const now = new Date();
+        $("clock").innerHTML = `<b>${now.toISOString().slice(11, 19)}</b> UTC`;
+    }
+
+    async function init() {
+
+        buildBars();
+        drawLcd("  QRP LABS QMX    CONNECTING... ");
+
+        try {
+            tables = await (await fetch("/api/radio/tables")).json();
+        }
+        catch {
+            // keep the defaults
+        }
+
+        try {
+            const settings = await (await fetch("/api/settings")).json();
+            myCall = String(settings.callsign || "").toUpperCase();
+            showCall();
+        }
+        catch {
+            // no callsign - {CALL} stays empty
+        }
+
+        buildKeys();
+        wire();
+        setupKnob();
+        setStep(step);
+
+        clock();
+        setInterval(clock, 1000);
+
+        poll();
+        setInterval(poll, 400);
+
+    }
+
+    init();
+
+})();

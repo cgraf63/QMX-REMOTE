@@ -1,0 +1,11 @@
+// /etc/polkit-1/rules.d/50-qmx-remote.rules
+//
+// The QMX-REMOTE server (user "qmx") may manage Wi-Fi through
+// NetworkManager (scan, add / change / delete connections, activate)
+// without sudo. Nothing else.
+
+polkit.addRule(function (action, subject) {
+    if (subject.user === "qmx" && action.id.indexOf("org.freedesktop.NetworkManager.") === 0) {
+        return polkit.Result.YES;
+    }
+});

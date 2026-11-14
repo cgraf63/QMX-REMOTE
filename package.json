@@ -1,0 +1,29 @@
+{
+  "name": "qmx-remote",
+  "version": "0.1.0",
+  "description": "Browser remote for QRP Labs QMX / QMX+ on a Raspberry Pi Zero 2 W",
+  "private": true,
+  "type": "module",
+  "author": "HB9OM",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc && rm -rf dist/public && cp -r src/public dist/public",
+    "typecheck": "tsc --noEmit",
+    "sim": "python3 tools/sim/qmx_sim.py",
+    "wifi-import": "node dist/cli/wifi-import.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
