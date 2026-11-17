@@ -121,8 +121,11 @@ button {
 .top a.ver { border-color: transparent; padding: 6px 4px; font-variant-numeric: tabular-nums; letter-spacing: 1px; }
 .top a.ver.new { border-color: var(--yellow); color: var(--yellow); padding: 6px 12px; font-weight: 700; }
 
+.top a { white-space: nowrap; }
+
 @media (max-width: 520px) {
-    .clock { display: none; }
+    .clock, .conn span { display: none; }
+    .top { gap: 10px; padding: 10px 14px; }
 }
 
 /* ---------------------------------------------------------------- layout */
