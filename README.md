@@ -19,6 +19,10 @@ Checked against the QMX CAT manual (firmware 1_04_003): the QMX speaks a subset 
 - Output power is **read only** over CAT (`PC;` = measured power in 0.1 W, only while transmitting) – there is no command to set it.
 - A carriage return switches the QMX port into terminal mode. That is why the installer masks **ModemManager** (it sends `AT…\r` to every new ttyACM port) and brltty.
 
+## Quick start (ready-made image)
+
+One A4 page for customers: [Kurzanleitung (Deutsch)](docs/quickstart/QMX-REMOTE_Kurzanleitung_DE.pdf) · [Quick start (English)](docs/quickstart/QMX-REMOTE_QuickStart_EN.pdf). Source and layout: `docs/quickstart/quickstart.py` (`python3 docs/quickstart/quickstart.py` rebuilds both PDFs; needs playwright + Chromium).
+
 ## Install on the Raspberry Pi
 
 Raspberry Pi OS Lite (Bookworm or newer, 32 or 64 bit) on a Zero 2 W, 3, 4 or 5. Write the card with the Raspberry Pi Imager (user, SSH and – if you like – Wi-Fi in its settings), then on the Pi:
