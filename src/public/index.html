@@ -117,6 +117,14 @@ button {
 
 .top a:hover { color: var(--text); }
 
+/* software version; "UPDATE" when a new one is on GitHub */
+.top a.ver { border-color: transparent; padding: 6px 4px; font-variant-numeric: tabular-nums; letter-spacing: 1px; }
+.top a.ver.new { border-color: var(--yellow); color: var(--yellow); padding: 6px 12px; font-weight: 700; }
+
+@media (max-width: 520px) {
+    .clock { display: none; }
+}
+
 /* ---------------------------------------------------------------- layout */
 
 .wrap {
@@ -651,6 +659,7 @@ input[type="range"]::-moz-range-thumb {
     <div class="conn" id="conn"><i></i><span id="conn-text">CONNECTING …</span></div>
     <div class="spacer"></div>
     <div class="clock" id="clock"></div>
+    <a href="/update.html" class="ver" id="ver" title="Software version - update">v…</a>
     <a href="/wifi.html" title="Wi-Fi networks">WI-FI</a>
 </div>
 
@@ -809,7 +818,7 @@ input[type="range"]::-moz-range-thumb {
 
 <div class="toast" id="toast"></div>
 
-<script src="/js/remote.js?v=1"></script>
+<script src="/js/remote.js?v=2"></script>
 
 </body>
 

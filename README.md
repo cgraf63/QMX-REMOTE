@@ -31,7 +31,7 @@ sudo ./scripts/install.sh            # options: --oled-driver sh1106, --no-oled,
 sudo reboot
 ```
 
-The script installs Node.js 22, creates the user `qmx`, builds into `/opt/qmx-remote`, sets the hostname `qmx-remote`, turns on I2C, masks ModemManager / brltty and installs the services (`qmx-remote` on port 80, `qmx-remote-oled`) and the polkit rule. Running it again after `git pull` updates the box.
+The script installs Node.js 22, creates the user `qmx`, puts the code as a git checkout into `/opt/qmx-remote` and builds it there, sets the hostname `qmx-remote`, turns on I2C, masks ModemManager / brltty and installs the services (`qmx-remote` on port 80, `qmx-remote-oled`, `qmx-remote-update@`) and the polkit rule. The options of the first run are kept in `/etc/qmx-remote/install.conf`. Later updates: from the browser (below), or `git pull` and the script again.
 
 Radio: USB cable to the Pi's **USB** port (not PWR) – on the Zero 2 W with a micro-USB OTG adapter or cable.
 
@@ -76,11 +76,22 @@ The box joins the home router or the phone hotspot. Setup in the browser: **WI-F
 
 On the Pi: `system/qmx-remote.service` (systemd, user `qmx`, imports `wifi.txt` as root before the start) and `system/50-qmx-remote.rules` (polkit: user `qmx` may manage NetworkManager, no sudo).
 
+## Software update
+
+The version is shown at the top of the remote page (`v0.2.0`); when a newer one is on GitHub it turns into a yellow **UPDATE 0.2.1** button. The **UPDATE** page (`/update.html`) shows the installed version, the new changes and the log of the last update.
+
+- **Check:** the box asks GitHub (`git fetch`) 3 minutes after the start and then every 12 hours, or with **CHECK NOW**. Only the changes are downloaded.
+- **Install:** about a minute – new code (`git reset` to `origin/main`), build, restart. The OLED shows **UPDATE**, then the new version. If the new version does not build, the box goes back to the old one. Not possible while the QMX transmits.
+- **How:** the server (user `qmx`) only reads the checkout; fetching and installing run as root in `qmx-remote-update@check` / `@install` (`scripts/update.sh`), which the polkit rule lets it start – nothing else. By hand: `sudo systemctl start qmx-remote-update@install`, log in `/var/lib/qmx-remote/update.log`.
+- **Version number:** `version` in `package.json` plus the commits after it – `0.2.0` + 3 commits = `0.2.3`. A new `version` (e.g. `0.3.0`) starts counting again.
+
+The repository must be public: the boxes fetch without credentials.
+
 ## OLED status display (optional)
 
-A 0.96" I2C OLED (SSD1306, 128 × 64; 1.3" SH1106 works too) shows the radio (QMX / QMX+) with frequency and mode (model inverted while transmitting), the Wi-Fi network with signal, the IP address and a turning logo – as long as it turns, the Pi is running. Without Wi-Fi it shows the setup hotspot name.
+A 0.96" I2C OLED (SSD1306, 128 × 64; 1.3" SH1106 works too) shows the software version for 3 s at the start (and “UPDATED TO …” after an update), then the radio (QMX / QMX+) with frequency and mode (model inverted while transmitting), the Wi-Fi network with signal, the IP address and a turning logo – as long as it turns, the Pi is running. Without Wi-Fi it shows the setup hotspot name.
 
-Wiring: VCC → pin 1 (3.3 V), GND → pin 6, SDA → pin 3, SCL → pin 5. `oled/qmx_oled.py` uses the Python standard library only (I2C directly via `/dev/i2c-1`); service: `system/qmx-remote-oled.service`. Preview without a display: `python3 oled/qmx_oled.py --demo --png preview.png`.
+Wiring: VCC → pin 1 (3.3 V), GND → pin 6, SDA → pin 3, SCL → pin 5. `oled/qmx_oled.py` uses the Python standard library only (I2C directly via `/dev/i2c-1`); service: `system/qmx-remote-oled.service`. Preview without a display: `python3 oled/qmx_oled.py --demo --png preview.png` (`--screen version|updated|updating` for the other screens).
 
 ## Test without a radio
 
@@ -108,13 +119,15 @@ Wi-Fi page without NetworkManager: `NMCLI=tools/sim/fake_nmcli.py` (state in `/t
 | `GET /api/wifi`, `…/saved`, `…/scan` | Wi-Fi status, saved networks, networks in range |
 | `POST /api/wifi/add`, `…/remove`, `…/order`, `…/connect` | manage networks, switch with fallback |
 | `GET/POST /api/wifi/ntfy`, `POST …/ntfy/test` | ntfy message with the address |
-| `GET /api/display` | everything the OLED shows (radio, frequency, Wi-Fi, IP) |
+| `GET /api/update`, `POST …/check`, `POST …/install` | software version, new commits, install (server restarts) |
+| `GET /api/display` | everything the OLED shows (radio, frequency, Wi-Fi, IP, version, update running) |
 | `WS /audio`, `WS /audio-tx` | RX / TX audio, 48 kHz, 16 bit, mono |
 
 ## Roadmap
 
 1. ~~Server from YAESU-REMOTE, QMX driver and page from SHACK-SERVER, detection with `VN;` / `OM;`~~
-2. Test on the Zero 2 W with QMX and QMX+ (detection, USB drop, sound card name)
-3. QDX: test, own band list
-4. TX audio from the browser (digital modes: `TX;` + USB audio), HTTPS for the microphone
-5. SD card image for the Zero 2 W
+2. ~~Software update from the browser, version on page and OLED~~
+3. Test on the Zero 2 W with QMX and QMX+ (detection, USB drop, sound card name, update)
+4. QDX: test, own band list
+5. TX audio from the browser (digital modes: `TX;` + USB audio), HTTPS for the microphone
+6. SD card image for the Zero 2 W

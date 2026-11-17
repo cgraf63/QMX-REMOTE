@@ -1,0 +1,21 @@
+# /etc/systemd/system/qmx-remote-update@.service
+#
+# Software update as root, started by the server (user qmx, polkit rule
+# 50-qmx-remote.rules) from the UPDATE page:
+#
+#   qmx-remote-update@check     git fetch
+#   qmx-remote-update@install   new version: git, build, restart
+#
+# Not part of qmx-remote.service: restarting the server does not stop it.
+
+[Unit]
+Description=QMX-REMOTE software update (%i)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=QMX_DIR=/opt/qmx-remote
+Environment=QMX_DATA=/var/lib/qmx-remote
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+ExecStart=/bin/bash /opt/qmx-remote/scripts/update.sh %i
+TimeoutStartSec=20min

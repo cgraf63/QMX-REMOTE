@@ -1,6 +1,7 @@
 import { BAND_VERSIONS, config, saveSettings, type QmxBandVersion } from "../config.js";
 import { HttpError, Router, sendJson } from "../http/server.js";
 import { radioManager } from "../services/radio/radio-manager.js";
+import { updateService } from "../services/system/update.service.js";
 import { QMX_BANDS, QMX_MODES, QMX_STEPS, QMX_VERSIONS } from "../services/radio/qmx.service.js";
 import type { QrpRadio } from "../services/radio/radio.interface.js";
 
@@ -35,6 +36,8 @@ export function radioRoutes(router: Router): void {
         const r = radioManager.getRadio();
         sendJson(res, 200, {
             name: "QMX-REMOTE",
+            version: updateService.getVersion(),
+            update: updateService.getBadge(),
             uptime: Math.round((Date.now() - started) / 1000),
             radio: radioManager.getStatus(),
             connected: r ? r.isConnected() : false

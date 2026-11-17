@@ -8,6 +8,7 @@
  *   POST /api/radio/bands     band version (saved on the box)
  *   GET/POST /api/settings    callsign for {CALL}
  *   WS   /audio               RX audio, 48 kHz, 16 bit, mono
+ *   GET  /api/status          software version, new one on GitHub? (every minute)
  *
  * The LCD shows the real 2 x 16 characters of the QMX (CAT "LC;"),
  * drawn as a 5 x 7 dot matrix. Older firmware without LC: the LCD is
@@ -765,6 +766,29 @@
         poll();
         setInterval(poll, 400);
 
+        version();
+        setInterval(version, 60_000);
+
+    }
+
+    /* software version in the top bar; marked when an update is waiting */
+    async function version() {
+        try {
+            const s = await (await fetch("/api/status", { cache: "no-store" })).json();
+            const v = s.version?.version || "";
+            const update = s.update || {};
+            const el = $("ver");
+            el.classList.toggle("new", update.behind > 0);
+            el.textContent = update.behind > 0
+                ? `UPDATE ${update.latest || ""}`.trim()
+                : (v ? `v${v}` : "v?");
+            el.title = update.behind > 0
+                ? `Installed: ${v} - new on GitHub: ${update.latest || `${update.behind} changes`}`
+                : `Software version ${v}${s.version?.commit ? ` (${s.version.commit})` : ""}`;
+        }
+        catch {
+            // server restarting
+        }
     }
 
     init();
