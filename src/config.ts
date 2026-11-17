@@ -11,7 +11,7 @@ import path from "node:path";
  *     "http":  { "port": 8080, "host": "0.0.0.0" },
  *     "cat":   { "device": "auto", "baudRate": 0 },
  *     "audio": { "enabled": true, "device": "auto" },      // or e.g. "plughw:CARD=Transceiver,DEV=0"
- *     "wifi":  { "interface": "wlan0" },
+ *     "wifi":  { "interface": "wlan0", "hotspot": false },  // hotspot: own setup Wi-Fi when offline
  *     "qmx":   { "bands": "auto" },                       // auto | 80-20 | 60-15 | 20-10 | plus
  *     "callsign": "HB9OM"                                 // {CALL} in the CW keys
  *   }
@@ -19,7 +19,8 @@ import path from "node:path";
  * "qmx.bands" and "callsign" are also set from the page (saveSettings).
  *
  * Environment: PORT, HOST, CAT_DEVICE, CAT_BAUD, AUDIO_DEVICE, AUDIO,
- * QMX_DATA (data directory), NMCLI (nmcli command, for tests).
+ * QMX_DATA (data directory), NMCLI (nmcli command, for tests),
+ * WIFI_HOTSPOT=1 (own setup Wi-Fi when offline, see wifi.service.ts).
  */
 
 export type QmxBandVersion = "auto" | "80-20" | "60-15" | "20-10" | "plus";
@@ -38,7 +39,7 @@ export interface Config {
      * Wi-Fi via NetworkManager. The setup network is the way in on the
      * first start: a phone hotspot with exactly this name and password.
      */
-    wifi: { interface: string; nmcli: string; setupSsid: string; setupPassword: string };
+    wifi: { interface: string; nmcli: string; setupSsid: string; setupPassword: string; hotspot: boolean };
     /* which bands the QMX has (auto = detected with BN;) */
     qmx: { bands: QmxBandVersion };
     callsign: string;
@@ -90,7 +91,9 @@ export const config: Config = {
         interface: file.wifi?.interface || "wlan0",
         nmcli: env.NMCLI || "nmcli",
         setupSsid: "QMX-REMOTE",
-        setupPassword: "qmx-remote"
+        setupPassword: "qmx-remote",
+        // ready-made image: on; own installation: scripts/install.sh --setup-hotspot
+        hotspot: env.WIFI_HOTSPOT ? env.WIFI_HOTSPOT === "1" : (file.wifi as { hotspot?: boolean } | undefined)?.hotspot === true
     },
     qmx: {
         bands: bandVersion(file.qmx?.bands)
